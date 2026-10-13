@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import './App.css'
 
 // ============ Sabit veriler ============
@@ -18,24 +18,42 @@ const LAST_NAMES = [
 
 const POSITIONS = ['GK', 'DEF', 'MID', 'FW']
 const POSITION_LABELS = { GK: 'Kaleci', DEF: 'Defans', MID: 'Orta Saha', FW: 'Forvet' }
+const FILTERS = ['DEF', 'MID', 'FW']
+const TEAM_LABELS = { black: 'Siyah', red: 'Kırmızı' }
 
 // Sahada yukarıdan aşağıya sıralama (üstte hücum, altta kale)
+// GKT = üstteki kale (sadece "Tümü" görünümünde, Kırmızı kaleci burada durur)
 const ROW_ORDER = ['FW', 'MID', 'DEF', 'GK']
+const ROW_ORDER_ALL = ['GKT', ...ROW_ORDER]
 
 // Maç düzeni: 7vs7 (1 kaleci + 6 oyuncu). Değiştirmek için sadece TEAM_SIZE'ı değiştir.
 const TEAM_SIZE = 7
 const FIELD_SLOTS = TEAM_SIZE - 1
-const MAX_PITCH = TEAM_SIZE * 2
+const MAX_FIELD = FIELD_SLOTS * 2 // sahadaki oyuncu sayısı (kaleciler hariç)
+const MAX_GK = 2
 
-// Kayıt sistemi
-const STAT_LABELS = { defans: 'DEF', atak: 'ATK', calim: 'ÇAL', kaleci: 'KAL' }
-const FIELDS = [
-  { key: 'defans', label: 'Defans' },
-  { key: 'atak', label: 'Atak' },
-  { key: 'calim', label: 'Çalım' },
-  { key: 'kaleci', label: 'Kaleci' }
+// Kayıt sistemi: oyuncu ve kaleci statları ayrı
+const STAT_LABELS = {
+  defans: 'DEF', atak: 'ATK', calim: 'ÇAL',
+  kavrama: 'KAV', refleks: 'REF', hava: 'HAV', ayak: 'AYK',
+  kaleci: 'KAL' // eski kayıtlar için
+}
+const FIELD_STATS = [
+  { key: 'defans', label: 'Defans', code: 'Defans' },
+  { key: 'atak', label: 'Atak', code: 'Atak' },
+  { key: 'calim', label: 'Çalım', code: 'Çalım' }
 ]
-const POS_BY_STAT = { defans: 'DEF', atak: 'FW', calim: 'MID', kaleci: 'GK' }
+const GK_STATS = [
+  { key: 'kavrama', label: 'Topu Kavrama', code: 'Kavrama' },
+  { key: 'refleks', label: 'Refleks', code: 'Refleks' },
+  { key: 'hava', label: 'Hava Topu', code: 'Hava' },
+  { key: 'ayak', label: 'Ayakla Oyun', code: 'Ayak' }
+]
+const FIELD_POS = { defans: 'DEF', atak: 'FW', calim: 'MID' }
+const GK_KEYS = GK_STATS.map(s => s.key)
+const KEY_ALIASES = {
+  havatopu: 'hava', ayakoyunu: 'ayak', ayaklaoyun: 'ayak', topukavrama: 'kavrama'
+}
 
 // ============ Yardımcı fonksiyonlar ============
 function getTier(rating) {
@@ -44,6 +62,17 @@ function getTier(rating) {
   if (rating >= 65) return { label: 'Orta', class: 'tier-orta' }
   return { label: 'Gelişim', class: 'tier-gelisim' }
 }
+
+const byRatingDesc = (a, b) => b.rating - a.rating
+
+// Oyuncunun stat özeti: "DEF 60 · ATK 70"
+const statLine = p =>
+  p.stats
+    ? Object.entries(p.stats).map(([k, v]) => `${STAT_LABELS[k] || k} ${v}`).join(' · ')
+    : ''
+
+// Üstteki kale satırı da kaleci pozisyonudur
+const posCode = r => (r === 'GKT' ? 'GK' : r)
 
 function generatePlayers() {
   const players = []
@@ -81,16 +110,28 @@ const removeIds = (t, ids) => ({
   field: t.field.filter(x => !ids.has(x))
 })
 
-// Otomatik takım kurma: en iyi 2 kaleci ayrı takımlara, kalanlar puana göre dengeli
-function autoFormTeams(players) {
-  const sorted = [...players].sort((a, b) => b.rating - a.rating)
-  const gks = sorted.filter(p => p.position === 'GK')
+// Otomatik takım kurma: seçili kaleciler korunur, kalan oyuncular puana göre dengeli dağıtılır
+function autoFormTeams(players, current) {
+  const sorted = [...players].sort(byRatingDesc)
+  const ratingOf = id => {
+    const p = players.find(x => x.id === id)
+    return p ? p.rating : 0
+  }
+  const has = id => players.some(p => p.id === id)
 
-  const black = { gk: gks[0] ? gks[0].id : null, field: [] }
-  const red = { gk: gks[1] ? gks[1].id : null, field: [] }
+  const black = { gk: has(current.black.gk) ? current.black.gk : null, field: [] }
+  const red = { gk: has(current.red.gk) ? current.red.gk : null, field: [] }
+
+  // Eksik kaleci yerlerini kaleci pozisyonundaki oyunculardan doldur
+  const spareGks = sorted.filter(
+    p => p.position === 'GK' && p.id !== black.gk && p.id !== red.gk
+  )
+  if (!black.gk && spareGks.length) black.gk = spareGks.shift().id
+  if (!red.gk && spareGks.length) red.gk = spareGks.shift().id
+
   const used = new Set([black.gk, red.gk])
-  let bs = gks[0] ? gks[0].rating : 0
-  let rs = gks[1] ? gks[1].rating : 0
+  let bs = black.gk ? ratingOf(black.gk) : 0
+  let rs = red.gk ? ratingOf(red.gk) : 0
   const count = t => t.field.length + (t.gk ? 1 : 0)
 
   for (const p of sorted) {
@@ -130,15 +171,20 @@ function usePersistentState(key, initial) {
 
 const clamp = n => Math.max(1, Math.min(99, n))
 
+// Türkçe karakterleri sadeleştir (Çalım = calim = CALIM)
+const norm = s =>
+  s.toLocaleLowerCase('tr')
+    .replace(/ç/g, 'c').replace(/ı/g, 'i').replace(/ö/g, 'o')
+    .replace(/ü/g, 'u').replace(/ş/g, 's').replace(/ğ/g, 'g')
+
 // Sürükleme sırasında imlecin hangi sıraya ve hangi kartın önüne denk geldiğini bulur
 function findDrop(x, y, dragId) {
+  const none = { row: null, beforeId: null, markerX: 0 }
   const pitchEl = document.querySelector('.pitch')
-  if (!pitchEl) return { row: null, beforeId: null, markerX: 0 }
+  if (!pitchEl) return none
 
   const pr = pitchEl.getBoundingClientRect()
-  if (x < pr.left || x > pr.right || y < pr.top || y > pr.bottom) {
-    return { row: null, beforeId: null, markerX: 0 }
-  }
+  if (x < pr.left || x > pr.right || y < pr.top || y > pr.bottom) return none
 
   // Dikeyde imlece en yakın sırayı seç
   let rowEl = null
@@ -148,37 +194,34 @@ function findDrop(x, y, dragId) {
     const d = y < b.top ? b.top - y : y > b.bottom ? y - b.bottom : 0
     if (d < best) { best = d; rowEl = r }
   }
-  if (!rowEl) return { row: null, beforeId: null, markerX: 0 }
+  if (!rowEl) return none
 
-  const rowRect = rowEl.getBoundingClientRect()
-  const cards = [...rowEl.querySelectorAll('[data-pid]')]
+  const cardsEl = rowEl.querySelector('.row-cards') || rowEl
+  const cr = cardsEl.getBoundingClientRect()
+  const cards = [...cardsEl.querySelectorAll('[data-pid]')]
     .filter(c => Number(c.dataset.pid) !== dragId)
 
   let beforeId = null
-  let markerX = rowRect.width / 2
+  let markerX = cr.width / 2
   for (const c of cards) {
     const r = c.getBoundingClientRect()
     if (x < r.left + r.width / 2) {
       beforeId = Number(c.dataset.pid)
-      markerX = r.left - rowRect.left - 6
+      markerX = r.left - cr.left - 6
       break
     }
   }
   if (beforeId === null && cards.length > 0) {
     const last = cards[cards.length - 1].getBoundingClientRect()
-    markerX = last.right - rowRect.left + 6
+    markerX = last.right - cr.left + 6
   }
 
   return { row: rowEl.dataset.row, beforeId, markerX }
 }
 
-// Türkçe karakterleri sadeleştir (Çalım = calim = CALIM)
-const norm = s =>
-  s.toLocaleLowerCase('tr')
-    .replace(/ç/g, 'c').replace(/ı/g, 'i').replace(/ö/g, 'o')
-    .replace(/ü/g, 'u').replace(/ş/g, 's').replace(/ğ/g, 'g')
-
-// Tek satırı oyuncuya çevirir: "x:Ahmet Haşim Defans:60 Atak:70 Çalım:80"
+// Tek satırı oyuncuya çevirir
+//   Oyuncu: "x:Ahmet Haşim Defans:60 Atak:70 Çalım:80"
+//   Kaleci: "x:Mert Kaya Kavrama:85 Refleks:80 Hava:70 Ayak:60"
 function parseLine(line) {
   const clean = line.trim().replace(/^x\s*:\s*/i, '')
   if (!clean) return null
@@ -193,36 +236,48 @@ function parseLine(line) {
 
   const stats = {}
   for (const m of clean.slice(statStart).matchAll(/(\S+?)\s*:\s*(\d{1,3})/g)) {
-    const key = norm(m[1])
-    if (!POS_BY_STAT[key]) return { error: `Bilinmeyen stat: ${m[1]}` }
+    let key = norm(m[1])
+    key = KEY_ALIASES[key] || key
+    if (key === 'kaleci') {
+      return { error: 'Kaleci statı kalktı, Kavrama / Refleks / Hava / Ayak kullan' }
+    }
+    if (!FIELD_POS[key] && !GK_KEYS.includes(key)) {
+      return { error: `Bilinmeyen stat: ${m[1]}` }
+    }
     stats[key] = clamp(Number(m[2]))
   }
 
   const entries = Object.entries(stats)
   if (entries.length === 0) return { error: 'Stat bulunamadı' }
 
+  const isGk = entries.some(([k]) => GK_KEYS.includes(k))
+  const hasField = entries.some(([k]) => FIELD_POS[k])
+  if (isGk && hasField) return { error: 'Kaleci ve oyuncu statları karıştırılamaz' }
+
   const rating = Math.round(entries.reduce((s, [, v]) => s + v, 0) / entries.length)
   const best = [...entries].sort((a, b) => b[1] - a[1])[0][0]
+  const position = isGk ? 'GK' : FIELD_POS[best]
 
-  return { firstName, lastName, position: POS_BY_STAT[best], rating, stats }
+  return { firstName, lastName, position, rating, stats }
 }
 
 // ============ Bileşenler ============
 
 function PlayerCard({
-  player, onClick, compact, onRate, onPosition, onPitch,
-  team, label, dragging, onPointerDown, onRemove
+  player, onClick, compact, onPitch,
+  team, label, dragging, selected, onPointerDown, onRemove
 }) {
   const tier = getTier(player.rating)
 
-  // Sahadaki kart (sürüklenebilir)
+  // Sahadaki kart
   if (compact) {
     return (
       <div
-        className={`pitch-card ${tier.class} ${dragging ? 'dragging' : ''}`}
+        className={`pitch-card ${tier.class} ${dragging ? 'dragging' : ''} ${selected ? 'selected' : ''}`}
         data-pid={player.id}
         onPointerDown={onPointerDown}
-        title="Sürükleyerek pozisyonunu değiştir"
+        onClick={onClick}
+        title="Dokun: seç · Bilgisayarda sürükleyebilirsin"
       >
         {team && <span className={`team-dot ${team}`}></span>}
         {onRemove && (
@@ -244,65 +299,117 @@ function PlayerCard({
   }
 
   // Sol paneldeki kart
-  const stop = e => e.stopPropagation()
-
   return (
     <div className={`player-card ${tier.class} ${onPitch ? 'on-pitch' : ''}`} onClick={onClick}>
       <div className="player-card-left">
         <span className="player-rating">{player.rating}</span>
-        <span className="player-pos">{player.position}</span>
       </div>
       <div className="player-card-right">
         <span className="player-name">{player.firstName} {player.lastName}</span>
         <span className="player-tier">{tier.label}{onPitch ? ' · sahada' : ''}</span>
-        {player.stats && (
-          <span className="player-stats">
-            {Object.entries(player.stats).map(([k, v]) => `${STAT_LABELS[k]} ${v}`).join(' · ')}
-          </span>
-        )}
+        {player.stats && <span className="player-stats">{statLine(player)}</span>}
       </div>
-      <div className="player-edit" onClick={stop}>
-        <div className="rate-controls">
-          <button className="rate-btn" onClick={() => onRate(-1)}>−</button>
-          <button className="rate-btn" onClick={() => onRate(1)}>+</button>
+      <span className={`pos-chip pos-${player.position}`} title="En iyi olduğu pozisyon">
+        {POSITION_LABELS[player.position]}
+      </span>
+    </div>
+  )
+}
+
+// Oyuncu seçme penceresi (mobilde alttan açılır)
+function Picker({ title, groups, onPick, onClose, full, fullText, emptyText }) {
+  const [query, setQuery] = useState('')
+  const q = norm(query.trim())
+
+  const shown = groups
+    .map(g => ({
+      ...g,
+      players: g.players.filter(p => norm(`${p.firstName} ${p.lastName}`).includes(q))
+    }))
+    .filter(g => g.players.length > 0)
+
+  const total = groups.reduce((s, g) => s + g.players.length, 0)
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{title}</h3>
+          <button className="panel-toggle" onClick={onClose}>✕</button>
         </div>
-        <select
-          className="pos-select"
-          value={player.position}
-          onChange={e => onPosition(e.target.value)}
-        >
-          {POSITIONS.map(pos => <option key={pos} value={pos}>{pos}</option>)}
-        </select>
+        <div className="modal-body">
+          {total > 6 && (
+            <input
+              className="search-input"
+              placeholder="İsim ara..."
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+            />
+          )}
+          {full && <p className="modal-hint warn">{fullText || 'Yer dolu.'}</p>}
+          {total === 0 && (
+            <p className="modal-hint">{emptyText || 'Seçilecek oyuncu yok.'}</p>
+          )}
+          {total > 0 && shown.length === 0 && <p className="modal-hint">Oyuncu bulunamadı.</p>}
+
+          {shown.map(g => (
+            <div key={g.label}>
+              <div className="slot-title">{g.label} <span>{g.players.length}</span></div>
+              <div className="pick-list">
+                {g.players.map(p => {
+                  const tier = getTier(p.rating)
+                  return (
+                    <button
+                      key={p.id}
+                      className={`pick-item ${tier.class}`}
+                      disabled={full}
+                      onClick={() => onPick(p.id)}
+                    >
+                      <span className="pick-rating">{p.rating}</span>
+                      <span className="pick-main">
+                        <span className="pick-name">{p.firstName} {p.lastName}</span>
+                        {p.stats && <span className="pick-stats">{statLine(p)}</span>}
+                      </span>
+                      <span className={`pos-chip pos-${p.position}`}>{POSITION_LABELS[p.position]}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          ))}
+
+          <button className="btn-secondary" onClick={onClose}>Kapat</button>
+        </div>
       </div>
     </div>
   )
 }
 
 function TeamBox({
-  teamName, color, gk, players,
-  unassignedGk, unassignedOther, otherName,
-  onAddGk, onAddField, onMove, onRemove
+  teamName, color, gk, players, posOf,
+  unassignedField, keeperGroups, otherName,
+  onAddGk, onAddField, onMove, onRemove, onRemoveGk
 }) {
+  const [picker, setPicker] = useState(null) // null | 'gk' | 'field'
+
   const all = gk ? [gk, ...players] : players
   const sum = all.reduce((s, p) => s + p.rating, 0)
   const fieldFull = players.length >= FIELD_SLOTS
-  const totalFree = unassignedGk.length + unassignedOther.length
 
-  const opt = p => (
-    <option key={p.id} value={p.id}>
-      {p.rating} · {p.position} · {p.firstName} {p.lastName}
-    </option>
-  )
-
+  // Pozisyon etiketi: oyuncunun SAHADAKİ yerine göre yazılır
   const row = (p, isGk) => {
     const tier = getTier(p.rating)
     return (
-      <div key={p.id} className={`team-player ${tier.class}`}>
+      <div key={p.id} className={`team-player ${tier.class} ${isGk ? 'gk-row' : ''}`}>
         <span className="team-player-rating">{p.rating}</span>
         <span className="team-player-name">{p.firstName} {p.lastName}</span>
-        <span className="team-player-pos">{isGk ? 'GK' : p.position}</span>
+        <span className="team-player-pos">{posOf(p)}</span>
         <button className="team-act" title={`${otherName} takıma geçir`} onClick={() => onMove(p.id)}>⇄</button>
-        <button className="team-act remove" title="Takımdan çıkar" onClick={() => onRemove(p.id)}>✕</button>
+        <button
+          className="team-act remove"
+          title={isGk ? 'Kaleciyi çıkar' : 'Takımdan çıkar'}
+          onClick={() => (isGk ? onRemoveGk() : onRemove(p.id))}
+        >✕</button>
       </div>
     )
   }
@@ -315,43 +422,26 @@ function TeamBox({
         <span className="team-count">{all.length}/{TEAM_SIZE} kişi</span>
       </div>
       <div className="team-body">
-        {/* Kaleci */}
-        <div className="slot-title">Kaleci <span>{gk ? 1 : 0}/1</span></div>
+        {/* Kaleci yeri */}
+        <div className="slot-title gk-title">Kaleci <span>{gk ? 1 : 0}/1</span></div>
         {gk ? (
           <div className="team-players">{row(gk, true)}</div>
         ) : (
-          <select
-            className="team-add"
-            value=""
-            disabled={totalFree === 0}
-            onChange={e => e.target.value && onAddGk(Number(e.target.value))}
-          >
-            <option value="">{totalFree > 0 ? '+ Kaleci seç...' : 'Sahada seçilecek oyuncu yok'}</option>
-            {unassignedGk.length > 0 && <optgroup label="Kaleciler">{unassignedGk.map(opt)}</optgroup>}
-            {unassignedOther.length > 0 && <optgroup label="Diğer oyuncular">{unassignedOther.map(opt)}</optgroup>}
-          </select>
+          <button className="slot-empty gk" onClick={() => setPicker('gk')}>
+            <span className="slot-no">K</span>+ Kaleci Seç
+          </button>
         )}
 
-        {/* Oyuncular */}
+        {/* Oyuncu yerleri */}
         <div className="slot-title">Oyuncular <span>{players.length}/{FIELD_SLOTS}</span></div>
-        <select
-          className="team-add"
-          value=""
-          disabled={fieldFull || totalFree === 0}
-          onChange={e => e.target.value && onAddField(Number(e.target.value))}
-        >
-          <option value="">
-            {fieldFull ? 'Takım dolu' : totalFree > 0 ? '+ Oyuncu ekle...' : 'Sahada seçilecek oyuncu yok'}
-          </option>
-          {unassignedOther.length > 0 && <optgroup label="Oyuncular">{unassignedOther.map(opt)}</optgroup>}
-          {unassignedGk.length > 0 && <optgroup label="Kaleciler">{unassignedGk.map(opt)}</optgroup>}
-        </select>
-
-        {players.length === 0 ? (
-          <p className="team-empty">Oyuncu yok</p>
-        ) : (
-          <div className="team-players">{players.map(p => row(p, false))}</div>
-        )}
+        <div className="team-players">
+          {players.map(p => row(p, false))}
+          {Array.from({ length: FIELD_SLOTS - players.length }, (_, i) => (
+            <button key={`empty-${i}`} className="slot-empty" onClick={() => setPicker('field')}>
+              <span className="slot-no">{players.length + i + 1}</span>+ Oyuncu Ekle
+            </button>
+          ))}
+        </div>
 
         {all.length > 0 && (
           <div className="team-summary">
@@ -360,6 +450,30 @@ function TeamBox({
           </div>
         )}
       </div>
+
+      {picker === 'gk' && (
+        <Picker
+          title={`${teamName} takım kalecisi`}
+          groups={keeperGroups}
+          emptyText="Listede seçilecek oyuncu yok."
+          onPick={id => { onAddGk(id); setPicker(null) }}
+          onClose={() => setPicker(null)}
+        />
+      )}
+      {picker === 'field' && (
+        <Picker
+          title={`${teamName} takım oyuncusu`}
+          groups={[{ label: 'Sahadaki oyuncular', players: unassignedField }]}
+          full={fieldFull}
+          fullText="Takım dolu."
+          emptyText="Sahada seçilecek oyuncu yok. Önce oyuncuyu sahaya ekle."
+          onPick={id => {
+            onAddField(id)
+            if (players.length + 1 >= FIELD_SLOTS) setPicker(null)
+          }}
+          onClose={() => setPicker(null)}
+        />
+      )}
     </div>
   )
 }
@@ -369,14 +483,16 @@ function Kayit({ onClose, onAdd, sampleCount, onClearSamples }) {
   const [tab, setTab] = useState('player')
 
   // Oyuncu sekmesi
+  const [kind, setKind] = useState('field') // field | gk
   const [first, setFirst] = useState('')
   const [last, setLast] = useState('')
   const [vals, setVals] = useState({})
   const [copied, setCopied] = useState(false)
 
-  const statText = FIELDS
+  const fields = kind === 'gk' ? GK_STATS : FIELD_STATS
+  const statText = fields
     .filter(f => vals[f.key])
-    .map(f => `${f.label}:${vals[f.key]}`)
+    .map(f => `${f.code}:${vals[f.key]}`)
     .join(' ')
   const code = first.trim() && last.trim() && statText
     ? `x:${first.trim()} ${last.trim()} ${statText}`
@@ -424,21 +540,35 @@ function Kayit({ onClose, onAdd, sampleCount, onClearSamples }) {
 
         {tab === 'player' ? (
           <div className="modal-body">
+            <div className="kind-switch">
+              <button
+                className={`filter-btn ${kind === 'field' ? 'active' : ''}`}
+                onClick={() => setKind('field')}
+              >Oyuncu</button>
+              <button
+                className={`filter-btn ${kind === 'gk' ? 'active gk' : ''}`}
+                onClick={() => setKind('gk')}
+              >Kaleci</button>
+            </div>
+
             <p className="modal-hint">
-              Bilgilerini gir, oluşan kodu kopyalayıp yöneticiye gönder. Boş bıraktığın stat hesaba katılmaz.
+              {kind === 'gk'
+                ? 'Kaleci olarak kendini 1-99 arası puanla. Oluşan kodu kopyalayıp yöneticiye gönder.'
+                : 'Bilgilerini gir, oluşan kodu kopyalayıp yöneticiye gönder. Boş bıraktığın stat hesaba katılmaz.'}
             </p>
             <div className="form-row">
               <input className="search-input" placeholder="İsim" value={first} onChange={e => setFirst(e.target.value)} />
               <input className="search-input" placeholder="Soyisim" value={last} onChange={e => setLast(e.target.value)} />
             </div>
             <div className="form-grid">
-              {FIELDS.map(f => (
+              {fields.map(f => (
                 <label key={f.key} className="stat-field">
                   <span>{f.label}</span>
                   <input
                     type="number"
                     min="1"
                     max="99"
+                    inputMode="numeric"
                     className="search-input"
                     value={vals[f.key] || ''}
                     onChange={e => setVals(v => ({ ...v, [f.key]: e.target.value }))}
@@ -459,7 +589,7 @@ function Kayit({ onClose, onAdd, sampleCount, onClearSamples }) {
             </p>
             <textarea
               className="code-input"
-              placeholder={'x:Ahmet Haşim Defans:60 Atak:70 Çalım:80\nx:Mert Kaya Kaleci:85 Defans:55'}
+              placeholder={'x:Ahmet Haşim Defans:60 Atak:70 Çalım:80\nx:Mert Kaya Kavrama:85 Refleks:80 Hava:70 Ayak:60'}
               value={text}
               onChange={e => setText(e.target.value)}
             />
@@ -495,18 +625,32 @@ export default function App() {
   const [pitchIds, setPitchIds] = usePersistentState('fifa.pitchIds', [])
   const [teams, setTeams] = usePersistentState('fifa.teams.v2', emptyTeams)
   const [savedTeams, setSavedTeams] = usePersistentState('fifa.savedTeams.v2', [])
-  // Sürükleyerek değiştirilen sıralar: { oyuncuId: 'MID' }
+  // Elle değiştirilen sıralar: { oyuncuId: 'MID' }
   const [rowOverride, setRowOverride] = usePersistentState('fifa.rows', {})
 
-  const [panelOpen, setPanelOpen] = useState(true)
+  // Mobilde panel kapalı başlar (çekmece), bilgisayarda açık
+  const [panelOpen, setPanelOpen] = useState(() => window.innerWidth > 800)
   const [search, setSearch] = useState('')
   const [filterPos, setFilterPos] = useState('ALL')
   const [teamName, setTeamName] = useState('')
   const [showReg, setShowReg] = useState(false)
   const [view, setView] = useState('all') // all | black | red
   const [drag, setDrag] = useState(null)  // { id, x, y, row, beforeId, markerX }
+  const [selectedId, setSelectedId] = useState(null)
+  const [keeperPicker, setKeeperPicker] = useState(null) // null | 'black' | 'red'
+  const [rowPicker, setRowPicker] = useState(null)       // null | 'FW' | 'MID' | 'DEF'
+  const [notice, setNotice] = useState('')
 
-  // ID -> oyuncu (puanlar değişince her yer otomatik güncellenir)
+  const suppressClick = useRef(false)
+  const noticeTimer = useRef(null)
+
+  function flash(msg) {
+    setNotice(msg)
+    clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(''), 2200)
+  }
+
+  // ID -> oyuncu
   const byId = useMemo(() => {
     const map = {}
     players.forEach(p => { map[p.id] = p })
@@ -531,12 +675,34 @@ export default function App() {
   ].filter(Boolean))
   const gkIds = new Set([teams.black.gk, teams.red.gk].filter(Boolean))
 
+  const fieldOnPitch = pitchPlayers.filter(p => !gkIds.has(p.id)).length
+
   // Sahada olup henüz takımı olmayanlar
-  const unassigned = pitchPlayers
-    .filter(p => !assigned.has(p.id))
-    .sort((a, b) => b.rating - a.rating)
-  const unassignedGk = unassigned.filter(p => p.position === 'GK')
-  const unassignedOther = unassigned.filter(p => p.position !== 'GK')
+  const unassignedField = pitchPlayers.filter(p => !assigned.has(p.id)).sort(byRatingDesc)
+
+  // Kaleci seçme listesi: kaleci olarak iyi olanlar önde, istersen herkes seçilebilir
+  const keeperCandidates = players.filter(p => !gkIds.has(p.id)).sort(byRatingDesc)
+  const keeperGroups = [
+    { label: 'Kaleci olarak iyi olanlar', players: keeperCandidates.filter(p => p.position === 'GK') },
+    { label: 'Diğer oyuncular', players: keeperCandidates.filter(p => p.position !== 'GK') }
+  ]
+
+  // Sahadaki bir sıraya oyuncu ekleme listesi
+  const rowCandidates = players
+    .filter(p => p.position !== 'GK' && !pitchIds.includes(p.id))
+    .sort(byRatingDesc)
+  const rowGroups = rowPicker
+    ? [
+        {
+          label: `${POSITION_LABELS[rowPicker]} olarak iyi olanlar`,
+          players: rowCandidates.filter(p => p.position === rowPicker)
+        },
+        {
+          label: 'Diğer oyuncular',
+          players: rowCandidates.filter(p => p.position !== rowPicker)
+        }
+      ]
+    : []
 
   function teamOf(id) {
     if (teams.black.gk === id || teams.black.field.includes(id)) return 'black'
@@ -544,29 +710,51 @@ export default function App() {
     return null
   }
 
-  // Sahada hangi sırada gösterilecek (sürükleme > takım kalecisi > pozisyon)
+  // Üstteki kale satırı sadece "Tümü" görünümünde var
+  function normRow(r) {
+    return r === 'GKT' && view !== 'all' ? 'GK' : r
+  }
+
+  // Sahada hangi sırada gösterilecek (elle seçilen > takım kalecisi > pozisyon)
   function rowOf(p) {
-    if (rowOverride[p.id]) return rowOverride[p.id]
-    if (gkIds.has(p.id)) return 'GK'
+    if (rowOverride[p.id]) return normRow(rowOverride[p.id])
+    if (gkIds.has(p.id)) {
+      return teams.red.gk === p.id && view === 'all' ? 'GKT' : 'GK'
+    }
     if (p.position === 'GK' && teamOf(p.id)) return 'DEF'
     return p.position
+  }
+
+  // Takım kutularında gösterilecek pozisyon = oyuncunun sahadaki yeri
+  const posOf = p => posCode(rowOf(p))
+
+  const rowsToShow = view === 'all' ? ROW_ORDER_ALL : ROW_ORDER
+
+  function rowLabel(row) {
+    if (row === 'GKT') return 'Kırmızı Kaleci'
+    if (row === 'GK') return view === 'all' ? 'Siyah Kaleci' : 'Kaleci'
+    return POSITION_LABELS[row]
   }
 
   const viewPlayers = view === 'all'
     ? pitchPlayers
     : pitchPlayers.filter(p => teamOf(p.id) === view)
 
-  const filteredPlayers = useMemo(() => {
+  // Sol liste: kaleci pozisyonundakiler sadece "Kaleciler" bölümünden eklenir
+  const listPlayers = useMemo(() => {
     return players
       .filter(p => {
+        if (p.position === 'GK') return false
         const matchesSearch = `${p.firstName} ${p.lastName}`.toLowerCase().includes(search.toLowerCase())
         const matchesPos = filterPos === 'ALL' || p.position === filterPos
         return matchesSearch && matchesPos
       })
-      .sort((a, b) => b.rating - a.rating)
+      .sort(byRatingDesc)
   }, [players, search, filterPos])
 
-  const pitchFull = pitchIds.length >= MAX_PITCH
+  const selectedPlayer =
+    selectedId != null && pitchIds.includes(selectedId) ? byId[selectedId] || null : null
+
   const sampleCount = players.filter(p => !p.stats).length
 
   // --- Saha ---
@@ -579,25 +767,35 @@ export default function App() {
     })
   }
 
-  function addToPitch(id) {
-    if (pitchIds.includes(id) || pitchFull) return
+  // Oyuncuyu sahaya ekler. row verilirse o sıraya, verilmezse kendi pozisyonunun sırasına koyar.
+  function addToPitch(id, row, announce) {
+    const p = byId[id]
+    if (!p || pitchIds.includes(id)) return
+    if (fieldOnPitch >= MAX_FIELD) {
+      return flash(`Sahada en fazla ${MAX_FIELD} oyuncu olabilir`)
+    }
     setPitchIds(prev => [...prev, id])
+    if (row && row !== p.position) setRowOverride(prev => ({ ...prev, [id]: row }))
+    if (announce) flash(`${p.firstName} ${p.lastName} → ${POSITION_LABELS[row || p.position]}`)
   }
 
   function removeFromPitch(id) {
     setPitchIds(prev => prev.filter(x => x !== id))
     unassign(id)
     clearRow(id)
+    if (selectedId === id) setSelectedId(null)
   }
 
   function clearPitch() {
     setPitchIds([])
     setTeams(emptyTeams())
     setRowOverride({})
+    setSelectedId(null)
   }
 
-  // --- Sürükle-bırak (fare ve dokunmatik) ---
+  // --- Sürükle-bırak (sadece fare/kalem; dokunmatikte seçim çubuğu kullanılır) ---
   function startDrag(e, player) {
+    if (e.pointerType === 'touch') return
     if (e.pointerType === 'mouse' && e.button !== 0) return
 
     const startX = e.clientX
@@ -620,8 +818,13 @@ export default function App() {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', up)
-      if (started && ev.type === 'pointerup') {
-        commitDrop(player.id, findDrop(ev.clientX, ev.clientY, player.id))
+      if (started) {
+        if (ev.type === 'pointerup') {
+          commitDrop(player.id, findDrop(ev.clientX, ev.clientY, player.id))
+        }
+        // Bırakma sonrası gelen "click" olayı seçim yapmasın
+        suppressClick.current = true
+        setTimeout(() => { suppressClick.current = false }, 80)
       }
       setDrag(null)
     }
@@ -642,15 +845,58 @@ export default function App() {
     })
   }
 
-  // --- Oyuncu düzenleme ---
-  function updatePlayer(id, patch) {
-    setPlayers(prev => prev.map(p => (p.id === id ? { ...p, ...patch } : p)))
+  // --- Seçili oyuncuyu taşıma (dokunmatik için) ---
+  function moveToRow(id, row) {
+    commitDrop(id, { row, beforeId: null })
+  }
+
+  function shiftInRow(id, dir) {
+    const p = byId[id]
+    if (!p) return
+    const row = rowOf(p)
+    const ids = viewPlayers.filter(x => rowOf(x) === row).map(x => x.id)
+    const i = ids.indexOf(id)
+    const other = ids[i + dir]
+    if (i < 0 || other === undefined) return
+    setPitchIds(prev => {
+      const a = [...prev]
+      const ia = a.indexOf(id)
+      const ib = a.indexOf(other)
+      if (ia < 0 || ib < 0) return prev
+      ;[a[ia], a[ib]] = [a[ib], a[ia]]
+      return a
+    })
+  }
+
+  function handleRowClick(e, pos) {
+    if (suppressClick.current || !selectedPlayer) return
+    if (e.target.closest('.pitch-card, .row-add')) return
+    moveToRow(selectedPlayer.id, pos)
+  }
+
+  // Sıra başlığındaki "+" butonu
+  function rowAdd(pos) {
+    if (pos === 'GKT') {
+      return !teams.red.gk ? (
+        <button className="row-add" onClick={() => setKeeperPicker('red')}>+ Kırmızı kaleci</button>
+      ) : null
+    }
+    if (pos === 'GK') {
+      const t = view === 'red' ? 'red' : 'black'
+      return !teams[t].gk ? (
+        <button className="row-add" onClick={() => setKeeperPicker(t)}>+ {TEAM_LABELS[t]} kaleci</button>
+      ) : null
+    }
+    // Oyuncular takım görünümünde takım kutusundan eklenir
+    return view === 'all' ? (
+      <button className="row-add" onClick={() => setRowPicker(pos)}>+ Oyuncu</button>
+    ) : null
   }
 
   // --- Takımlar ---
   function handleAutoForm() {
     if (pitchPlayers.length < 2) return
-    setTeams(autoFormTeams(pitchPlayers))
+    setTeams(autoFormTeams(pitchPlayers, teams))
   }
 
   function clearTeams() {
@@ -688,6 +934,14 @@ export default function App() {
     placeInTeam(to, id, asGk)
   }
 
+  // Kaleci seçer: oyuncu otomatik sahaya ve o takımın kaleci yerine geçer
+  function setKeeper(team, id) {
+    if (!byId[id]) return
+    if (teams[team].gk) return flash(`${TEAM_LABELS[team]} takımın kalecisi zaten seçili`)
+    setPitchIds(prev => (prev.includes(id) ? prev : [...prev, id]))
+    placeInTeam(team, id, true)
+  }
+
   // --- Oyuncu kaydı (kodlardan ekleme) ---
   function addPlayers(parsed) {
     setPlayers(prev => {
@@ -718,6 +972,7 @@ export default function App() {
       Object.keys(prev).forEach(k => { if (!ids.has(Number(k))) next[k] = prev[k] })
       return next
     })
+    setSelectedId(null)
   }
 
   // --- Takım kaydetme ---
@@ -742,6 +997,7 @@ export default function App() {
     setPitchIds(entry.pitchIds.filter(ok))
     setTeams({ black: fix(entry.teams.black), red: fix(entry.teams.red) })
     setRowOverride(entry.rows || {})
+    setSelectedId(null)
   }
 
   function deleteTeam(id) {
@@ -789,21 +1045,57 @@ export default function App() {
 
   return (
     <div className={`app ${drag ? 'is-dragging' : ''}`}>
-      {/* Sol Panel — Oyuncu Listesi */}
+      {/* Sol Panel — masaüstünde kenar çubuğu, mobilde tam ekran çekmece */}
       <aside className={`player-panel ${panelOpen ? 'open' : 'closed'}`}>
         <div className="panel-header">
           <h2 className="panel-title">Oyuncular ({players.length})</h2>
           <button className="panel-toggle" onClick={() => setPanelOpen(!panelOpen)}>
             {panelOpen ? '◀' : '▶'}
           </button>
+          <button className="panel-close" onClick={() => setPanelOpen(false)}>Kapat ✕</button>
         </div>
 
         {panelOpen && (
           <div className="panel-body">
+            {/* Kaleciler: ayrı bölüm, takıma doğrudan eklenir */}
+            <div className="keeper-box">
+              <div className="slot-title gk-title">Kaleciler <span>{gkIds.size}/{MAX_GK}</span></div>
+              <div className="keeper-slots">
+                {['black', 'red'].map(t => {
+                  const kp = byId[teams[t].gk]
+                  return (
+                    <div key={t} className="keeper-slot">
+                      <span className="keeper-team">
+                        <i className={`dot ${t}`}></i>{TEAM_LABELS[t]} Kaleci
+                      </span>
+                      {kp ? (
+                        <div className="keeper-filled">
+                          <div className="keeper-info">
+                            <span className="keeper-name">{kp.firstName} {kp.lastName}</span>
+                            {kp.stats && <span className="keeper-stats">{statLine(kp)}</span>}
+                          </div>
+                          <span className="keeper-rating">{kp.rating}</span>
+                          <button
+                            className="team-act remove"
+                            title="Kaleciyi çıkar"
+                            onClick={() => removeFromPitch(kp.id)}
+                          >✕</button>
+                        </div>
+                      ) : (
+                        <button className="keeper-add" onClick={() => setKeeperPicker(t)}>
+                          + Kaleci Seç
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
             <div className="panel-search">
               <input
                 type="text"
-                placeholder="İsim ara..."
+                placeholder="Oyuncu ara..."
                 value={search}
                 onChange={e => setSearch(e.target.value)}
                 className="search-input"
@@ -815,30 +1107,39 @@ export default function App() {
                 className={`filter-btn ${filterPos === 'ALL' ? 'active' : ''}`}
                 onClick={() => setFilterPos('ALL')}
               >Tümü</button>
-              {POSITIONS.map(pos => (
+              {FILTERS.map(pos => (
                 <button
                   key={pos}
                   className={`filter-btn ${filterPos === pos ? 'active' : ''}`}
                   onClick={() => setFilterPos(pos)}
-                >{pos}</button>
+                >{POSITION_LABELS[pos]}</button>
               ))}
             </div>
 
+            <div className="list-info">
+              Oyuncular · sahada {fieldOnPitch}/{MAX_FIELD}
+            </div>
+
             <div className="player-list">
-              {filteredPlayers.map(player => {
+              {listPlayers.map(player => {
                 const onPitch = pitchIds.includes(player.id)
                 return (
                   <PlayerCard
                     key={player.id}
                     player={player}
                     onPitch={onPitch}
-                    onClick={() => (onPitch ? removeFromPitch(player.id) : addToPitch(player.id))}
-                    onRate={d => updatePlayer(player.id, { rating: clamp(player.rating + d) })}
-                    onPosition={pos => { updatePlayer(player.id, { position: pos }); clearRow(player.id) }}
+                    onClick={() => {
+                      if (onPitch) {
+                        removeFromPitch(player.id)
+                        flash(`${player.firstName} ${player.lastName} sahadan çıkarıldı`)
+                      } else {
+                        addToPitch(player.id, null, true)
+                      }
+                    }}
                   />
                 )
               })}
-              {filteredPlayers.length === 0 && (
+              {listPlayers.length === 0 && (
                 <p className="empty-text">Oyuncu bulunamadı</p>
               )}
             </div>
@@ -855,27 +1156,32 @@ export default function App() {
         )}
       </aside>
 
+      {/* Mobilde paneli açan buton */}
+      {!panelOpen && !selectedPlayer && (
+        <button className="panel-fab" onClick={() => setPanelOpen(true)}>+ Oyuncu / Kaleci</button>
+      )}
+
       {/* Sağ Taraf */}
       <main className="main-content">
         <div className="content-header">
-          <h1 className="page-title">FIFA Takım Kurma Sistemi</h1>
-          <div className="pitch-info">
-            <span className="pitch-count">{pitchIds.length}/{MAX_PITCH} oyuncu</span>
-          </div>
+          <h1 className="page-title">FIFA Takım Kurma</h1>
+          <span className="pitch-count">
+            Oyuncu {fieldOnPitch}/{MAX_FIELD} · Kaleci {gkIds.size}/{MAX_GK}
+          </span>
         </div>
 
         <div className="action-bar">
           <button className="btn-primary" onClick={handleAutoForm} disabled={pitchPlayers.length < 2}>
             Otomatik Takım Kur
           </button>
+          <button className="btn-secondary" onClick={() => setShowReg(true)}>
+            Oyuncu Kaydı
+          </button>
           <button className="btn-secondary" onClick={clearTeams} disabled={assigned.size === 0}>
             Takımları Temizle
           </button>
           <button className="btn-secondary" onClick={clearPitch} disabled={pitchIds.length === 0}>
             Sahayı Temizle
-          </button>
-          <button className="btn-secondary" onClick={() => setShowReg(true)}>
-            Oyuncu Kaydı
           </button>
         </div>
 
@@ -888,7 +1194,7 @@ export default function App() {
 
         {/* Halı Saha (dikey) */}
         <div className="pitch-container">
-          <div className="pitch">
+          <div className={`pitch ${selectedPlayer ? 'selecting' : ''}`}>
             <div className="pitch-line outer"></div>
             <div className="pitch-line center-circle"></div>
             <div className="pitch-line center-line"></div>
@@ -897,33 +1203,44 @@ export default function App() {
             <div className="pitch-line goal-top"></div>
             <div className="pitch-line goal-bottom"></div>
 
-            {/* Üstte forvet, altta kaleci */}
+            {/* Üstte kale/forvet, altta kaleci */}
             <div className="pitch-rows">
-              {ROW_ORDER.map(pos => {
+              {rowsToShow.map(pos => {
                 const rowPlayers = viewPlayers.filter(p => rowOf(p) === pos)
                 const isTarget = drag && drag.row === pos
                 return (
                   <div
                     key={pos}
                     data-row={pos}
-                    className={`pitch-row ${isTarget ? 'drop-target' : ''}`}
+                    className={`pitch-row ${pos.startsWith('GK') ? 'goal-row' : ''} ${isTarget ? 'drop-target' : ''}`}
+                    onClick={e => handleRowClick(e, pos)}
                   >
-                    <span className="row-label">{POSITION_LABELS[pos]}</span>
-                    {rowPlayers.map(player => (
-                      <PlayerCard
-                        key={player.id}
-                        player={player}
-                        label={pos}
-                        team={teamOf(player.id)}
-                        dragging={!!drag && drag.id === player.id}
-                        onPointerDown={e => startDrag(e, player)}
-                        onRemove={() => removeFromPitch(player.id)}
-                        compact={true}
-                      />
-                    ))}
-                    {isTarget && (
-                      <div className="drop-marker" style={{ left: drag.markerX - 2 }}></div>
-                    )}
+                    <div className="row-head">
+                      <span className="row-label">{rowLabel(pos)}</span>
+                      {rowAdd(pos)}
+                    </div>
+                    <div className="row-cards">
+                      {rowPlayers.map(player => (
+                        <PlayerCard
+                          key={player.id}
+                          player={player}
+                          label={posCode(pos)}
+                          team={teamOf(player.id)}
+                          dragging={!!drag && drag.id === player.id}
+                          selected={selectedId === player.id}
+                          onPointerDown={e => startDrag(e, player)}
+                          onClick={() => {
+                            if (suppressClick.current) return
+                            setSelectedId(prev => (prev === player.id ? null : player.id))
+                          }}
+                          onRemove={() => removeFromPitch(player.id)}
+                          compact={true}
+                        />
+                      ))}
+                      {isTarget && (
+                        <div className="drop-marker" style={{ left: drag.markerX - 2 }}></div>
+                      )}
+                    </div>
                   </div>
                 )
               })}
@@ -933,14 +1250,42 @@ export default function App() {
               <div className="pitch-empty-hint">
                 <p>
                   {view === 'all'
-                    ? 'Sol panelden oyuncu seçerek sahaya ekleyin'
+                    ? 'Oyuncu eklemek için sıralardaki "+ Oyuncu" butonunu veya oyuncu listesini kullan'
                     : 'Bu takımda henüz oyuncu yok'}
                 </p>
               </div>
             )}
           </div>
+
+          {/* Seçili oyuncuyu taşıma çubuğu (dokunmatik ve masaüstü) */}
+          {selectedPlayer && (
+            <div className="selection-bar">
+              <div className="sel-info">
+                <strong>{selectedPlayer.firstName} {selectedPlayer.lastName}</strong>
+                <span>{POSITION_LABELS[posOf(selectedPlayer)]} sırasında</span>
+              </div>
+              <div className="sel-rows">
+                {ROW_ORDER.map(r => (
+                  <button
+                    key={r}
+                    className={`sel-btn ${posOf(selectedPlayer) === r ? 'active' : ''}`}
+                    onClick={() => moveToRow(selectedPlayer.id, r)}
+                  >{POSITION_LABELS[r]}</button>
+                ))}
+              </div>
+              <div className="sel-actions">
+                <button className="sel-btn" onClick={() => shiftInRow(selectedPlayer.id, -1)}>◀</button>
+                <button className="sel-btn" onClick={() => shiftInRow(selectedPlayer.id, 1)}>▶</button>
+                <button className="sel-btn danger grow" onClick={() => removeFromPitch(selectedPlayer.id)}>
+                  Sahadan Çıkar
+                </button>
+                <button className="sel-btn grow" onClick={() => setSelectedId(null)}>Bitti</button>
+              </div>
+            </div>
+          )}
+
           <p className="pitch-tip">
-            İpucu: kartı tutup başka bir sıraya bırakarak pozisyonunu değiştir, aynı sırada sürükleyerek yerini ayarla.
+            Karta dokun, alttaki çubukla istediğin sıraya taşı. Bilgisayarda kartı sürükleyip de bırakabilirsin.
           </p>
         </div>
 
@@ -951,26 +1296,30 @@ export default function App() {
             color="black"
             gk={blackGk}
             players={blackField}
-            unassignedGk={unassignedGk}
-            unassignedOther={unassignedOther}
+            posOf={posOf}
+            unassignedField={unassignedField}
+            keeperGroups={keeperGroups}
             otherName="Kırmızı"
-            onAddGk={id => placeInTeam('black', id, true)}
+            onAddGk={id => setKeeper('black', id)}
             onAddField={id => placeInTeam('black', id, false)}
             onMove={id => moveToOther('black', id)}
             onRemove={unassign}
+            onRemoveGk={() => teams.black.gk && removeFromPitch(teams.black.gk)}
           />
           <TeamBox
             teamName="Kırmızı"
             color="red"
             gk={redGk}
             players={redField}
-            unassignedGk={unassignedGk}
-            unassignedOther={unassignedOther}
+            posOf={posOf}
+            unassignedField={unassignedField}
+            keeperGroups={keeperGroups}
             otherName="Siyah"
-            onAddGk={id => placeInTeam('red', id, true)}
+            onAddGk={id => setKeeper('red', id)}
             onAddField={id => placeInTeam('red', id, false)}
             onMove={id => moveToOther('red', id)}
             onRemove={unassign}
+            onRemoveGk={() => teams.red.gk && removeFromPitch(teams.red.gk)}
           />
         </div>
 
@@ -1018,11 +1367,35 @@ export default function App() {
         <div className="drag-ghost" style={{ left: drag.x, top: drag.y }}>
           <PlayerCard
             player={dragPlayer}
-            label={rowOf(dragPlayer)}
+            label={posOf(dragPlayer)}
             team={teamOf(dragPlayer.id)}
             compact={true}
           />
         </div>
+      )}
+
+      {/* Kaleci seçme (panelden veya sahadan) */}
+      {keeperPicker && (
+        <Picker
+          title={`${TEAM_LABELS[keeperPicker]} takım kalecisi`}
+          groups={keeperGroups}
+          emptyText="Listede seçilecek oyuncu yok."
+          onPick={id => { setKeeper(keeperPicker, id); setKeeperPicker(null) }}
+          onClose={() => setKeeperPicker(null)}
+        />
+      )}
+
+      {/* Sahadaki bir sıraya istediğin oyuncuyu ekleme */}
+      {rowPicker && (
+        <Picker
+          title={`${POSITION_LABELS[rowPicker]} sırasına oyuncu ekle`}
+          groups={rowGroups}
+          full={fieldOnPitch >= MAX_FIELD}
+          fullText={`Sahada en fazla ${MAX_FIELD} oyuncu olabilir.`}
+          emptyText="Eklenecek başka oyuncu kalmadı."
+          onPick={id => addToPitch(id, rowPicker)}
+          onClose={() => setRowPicker(null)}
+        />
       )}
 
       {showReg && (
@@ -1033,6 +1406,8 @@ export default function App() {
           onClearSamples={clearSamples}
         />
       )}
+
+      {notice && <div className="toast">{notice}</div>}
     </div>
   )
 }
